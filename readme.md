@@ -1,3 +1,8 @@
+# Free AskAlex
+This fork retains the core idea of the original project but simplifies it by removing the Shiny app and focusing on a single Python script. The script handles all search and analysis tasks using local, open-source models, making it easier to run and maintain without external dependencies.
+
+---
+
 
 # AskAlex
 

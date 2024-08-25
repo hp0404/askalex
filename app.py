@@ -1,187 +1,136 @@
-# %%
-from shiny import App, render, ui, reactive
-import os
-from askalex import answer_question, get_keywords, show_cost
-from openalex import find_abs, get_embed, search_docs, style_dataframe
+from functools import lru_cache
+from typing import List, Optional
 
-# %%
-sample_keys = ["TYK2", "DLBCL", "ProTiler"]
-model_engine_dict = {
-    "gpt-4-32k": "gpt-4-32k (slower)",
-    "gpt-4": "gpt-4",
-    "gpt-35-turbo-16k": "gpt-35-turbo-16k",
-    "gpt-35-turbo": "gpt-35-turbo (faster)",
-}
+import numpy as np
+import pandas as pd
+import pyalex
+from openai import OpenAI
 
-oa_sample_questions = [
-    # "On a scale from 0—10, what score would you give the gene BRCA1 for its association with breast cancer?",
-    # "What are some key points about TYK2?",
-    # "How do current clinical guidelines address the use of anticoagulants in patients with atrial fibrillation?",
-    # "How does the effectiveness of traditional chemotherapy compare to targeted therapies in the treatment of leukemia?",
-    # "What are the key differences between the molecular mechanisms of apoptosis and necrosis?",
-    "How does tau malfunction in Alzheimer's?",
-    "How does FTO affect obesity risk?",
-    "What is hydroxychloroquine's efficacy in rheumatoid arthritis?",
-    "How reliable is CRP as an inflammation marker?",
-    "How does the Mediterranean diet reduce heart disease risk?",
-    "How does Epstein-Barr virus lead to lymphoma?",
-]
+RESEARCH_QUESTION = "What is the role of BRCA2 in breast cancer?"
+MAX_WORDS = 500
+MAX_LENGTH = 300
 
-if os.getenv("APP_RUN") == "local":
-    bms_proxy = "http://proxy-server.bms.com:8080/"
-    os.environ["http_proxy"] = bms_proxy
-    os.environ["https_proxy"] = bms_proxy
-    os.environ["ftp_proxy"] = bms_proxy
-    os.environ["no_proxy"] = ".celgene.com,.bms.com"
+model = "phi3.5:3.8b-mini-instruct-q4_0"
+client = OpenAI(
+    base_url="http://localhost:11434/v1",
+    api_key="ollama",
+)
+search_template = (
+    "I would like to search the literature to find answer for the following question. "
+    + "Give me 2 to 3 keywords that I should include in my literature search. "
+    + 'List the most important keyword first and concatenate them by "+". '
+    + 'Make them concise, for example: use "ABCC1" instead of "ABCC1 gene". '
+    + "For example, for the question "
+    + '"What is the biological rationale for an association between the gene ABCC1 and cardiotoxicity?" '
+    + 'The keywords are "ABCC1+cardiotoxicity+biological rationale". '
+    + "\n\nQuestion: {question}\nAnswer: "
+)
 
-
-my_nav = [
-    ui.nav(
-        "",
-        ui.layout_sidebar(
-            ui.panel_sidebar(
-                ui.input_select(
-                    "oa_engine",
-                    "LLM model",
-                    model_engine_dict,
-                ),
-                ui.input_slider(
-                    "n_articles",
-                    "Number of articles to index:",
-                    min=3,
-                    max=20,
-                    value=6,
-                ),
-                ui.p("Estimated cost:"),
-                ui.output_text("oa_cost"),
-            ),
-            ui.panel_main(
-                ui.input_switch("oa_sample", "Use an example", False),
-                ui.output_ui("out_question"),
-                ui.input_action_button("oa_submit", "Submit"),
-                ui.output_text("oa_txt"),
-            ),
-        ),
-        ui.output_table("oa_articles_tab"),
-    ),
-    ui.nav_spacer(),
-    ui.nav_menu(
-        "🔗",
-        ui.nav_control(
-            ui.a(
-                "Source code",
-                href="https://github.com/trangdata/askalex",
-                target="_blank",
-            ),
-        ),
-        align="right",
-    ),
-]
-
-app_ui = ui.page_navbar(
-    my_nav,
-    title="🦙  AskAlex",
-    bg="#014b75",
-    inverse=True,
-    id="navbar_id",
+rag_template = (
+    "You are an intelligent assistant helping users with their questions. "
+    + "Use 'you' to refer to the individual asking the questions even if they ask with 'I'. "
+    + "Answer the following question using only the data provided in the sources below. "
+    + "For tabular information return it as an html table. Do not return markdown format. "
+    + "If you cannot answer using the sources below, say you don't know. "
+    + "\n\nContext: {context}\n\n---\n\nQuestion: {question}\nAnswer: "
 )
 
 
-def server(input, output, session):
-    ids: list[str] = []
-
-    @output
-    @render.ui
-    @reactive.event(
-        input.oa_quick_submit,
-        input.oa_submit,
-        input.ps_submit,
+@lru_cache(maxsize=None)
+def answer(
+    prompt: str,
+    max_tokens: int = 1024,
+    model: str = "phi3.5:3.8b-mini-instruct-q4_0",
+    temperature: float = 0.3,
+) -> str:
+    response = client.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        model=model,
+        temperature=temperature,
     )
-    def refs():
-        return ui.h4("References")
-
-    def embedded_abs(abs):
-        if abs is None:
-            return None
-        nonlocal ids
-        id = ui.notification_show("Computing embeddings...", duration=None)
-        ids.append(id)
-        emb = get_embed(abs)
-        return emb
-
-    ## OpenAlex tab: Custom: oa_
-    @reactive.Calc
-    @reactive.event(input.oa_submit)
-    def oa_articles():
-        df = search_docs(
-            embedded_abs(find_abs(get_keywords(input.oa_question()))),
-            input.oa_question(),
-            top_n=input.n_articles(),
-        )
-        return df
-
-    @output
-    @render.table
-    def oa_articles_tab():
-        if oa_articles() is None:
-            return None
-        return style_dataframe(oa_articles()).style.hide(axis="index")
-
-    result = reactive.Value()
-
-    @reactive.Effect
-    @reactive.event(input.oa_submit)
-    def _():
-        nonlocal ids
-        if oa_articles() is None:
-            return None
-        notif = ui.notification_show("Connecting to OpenAI...", duration=30)
-        answer = answer_question(
-            question=input.oa_question(),
-            df=oa_articles(),
-            model=input.oa_engine(),
-        )
-        ui.notification_remove(notif)
-
-        if ids:
-            ui.notification_remove(ids.pop())
-
-        result.set(answer)
-
-    @output
-    @render.text
-    def oa_txt():
-        res = result.get()
-        if res is not None:
-            return f"\n{res[0]}"
-
-    @output
-    @render.text
-    def oa_cost():
-        res = result.get()
-        if res is not None:
-            return show_cost(res[1][0])
-
-    @output
-    @render.ui
-    def out_question():
-        if input.oa_sample():
-            return ui.input_select(
-                "oa_question",
-                "",
-                oa_sample_questions,
-                selected=oa_sample_questions[0],
-                width="100%",
-            )
-
-        return (
-            ui.input_text(
-                "oa_question",
-                "",
-                placeholder="What is mTOR's role in aging?",
-                width="100%",
-            ),
-        )
+    return response.choices[0].message.content
 
 
-app = App(app_ui, server, debug=True)
+def get_keywords(question: str) -> str:
+    keywords = answer(prompt=search_template.format(question=question))
+    return keywords.split("\n")[0].strip()
+
+
+def remove_last_keyword(s: str) -> str:
+    return s.rsplit("+", 1)[0]
+
+
+def shorten_abstract(text: str) -> str:
+    words = text.split()
+    return " ".join(words[:MAX_LENGTH]) if len(words) > MAX_WORDS else text
+
+
+@lru_cache(maxsize=None)
+def get_embedding(text: str, model: str = "nomic-embed-text") -> List[float]:
+    return client.embeddings.create(input=[text], model=model).data[0].embedding
+
+
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+
+def search_works(keywords: str) -> Optional[List[dict]]:
+    while keywords:
+        works = pyalex.Works().search_filter(abstract=keywords).get(per_page=100)
+        if works:
+            return works
+        keywords = remove_last_keyword(keywords)
+    return None
+
+
+def create_abstracts_dataframe(works: List[dict]) -> pd.DataFrame:
+    df = pd.DataFrame(
+        [
+            {
+                "title": e["title"],
+                "abstract": shorten_abstract(e["abstract"]),
+                "url": e["doi"],
+            }
+            for e in works
+        ]
+    )
+    df["embedding"] = df.abstract.apply(get_embedding)
+    return df
+
+
+def search_docs(df: pd.DataFrame, query: str, top_n: int = 10) -> Optional[str]:
+    if df is None:
+        return None
+
+    query_embedding = get_embedding(query)
+    df["similarities"] = df.embedding.apply(
+        lambda x: cosine_similarity(x, query_embedding)
+    )
+    top_results = df.nlargest(top_n, "similarities")
+
+    context = "\n\n".join(
+        [
+            f"### {record['title']}\n{record['abstract']}"
+            for record in top_results.to_dict(orient="records")
+        ]
+    )
+    return context
+
+
+if __name__ == "__main__":
+    question = "How different countries view Ukrainian NATO alignment?"
+    keywords = get_keywords(question)
+    works = search_works(keywords)
+    if not works:
+        print("No relevant works found.")
+
+    abs_df = create_abstracts_dataframe(works)
+    documents = search_docs(abs_df, question)
+
+    if not documents:
+        print("No relevant documents found.")
+
+    prompt = rag_template.format(context=documents, question=question)
+    answered = answer(prompt=prompt)
+    print(answered)
